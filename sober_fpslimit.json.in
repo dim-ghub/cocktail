@@ -1,0 +1,20 @@
+{
+  "file_format_version": "1.1.2",
+  "layer": {
+    "name": "VK_LAYER_SOBER_fpslimit",
+    "type": "GLOBAL",
+    "library_path": "@LIB@",
+    "api_version": "1.4.0",
+    "implementation_version": "1",
+    "description": "Live-adjustable FPS limiter for Sober",
+    "functions": {
+      "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+    },
+    "enable_environment": {
+      "SOBER_FPSLIMIT": "1"
+    },
+    "disable_environment": {
+      "DISABLE_SOBER_FPSLIMIT": "1"
+    }
+  }
+}

@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# Change Sober's FPS cap on the fly (via the VK_LAYER_SOBER_fpslimit layer).
+#
+#   soberfps                      show current cap
+#   soberfps 144                  cap at 144 fps
+#   soberfps off                  remove the cap (0 also works)
+#
+# Patterns (run in the foreground; Ctrl-C restores the cap you had before):
+#   soberfps random MAX [MIN]     jump to a random cap in MIN..MAX (MIN defaults to 1)
+#   soberfps seq CAP CAP ...      step through the given caps, e.g. seq 1 12 123
+#   soberfps ramp FROM TO [STEP]  count from FROM to TO and back by STEP (default 1)
+#   soberfps wave MIN MAX [SECS]  smooth sine wave between MIN and MAX, one cycle per SECS (default 10)
+#
+# Pattern options:
+#   -e, --every SECS              time between changes; a range like 0.5-3 picks a
+#                                 random delay each step (default 1, wave: 0.1)
+#   --once                        stop at the end instead of repeating (seq, ramp)
+#   -q, --quiet                   don't print each change
+set -euo pipefail
+
+APP_DIR="$HOME/.var/app/org.vinegarhq.Sober"
+CAP_FILE="${SOBER_FPS_FILE:-$APP_DIR/cache/sober-fpscap}"
+XML="$APP_DIR/data/sober/appData/GlobalBasicSettings_13.xml"
+
+die() { echo "soberfps: $*" >&2; exit 1; }
+is_num() { [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]; }
+need_num() { is_num "$2" || die "$1 must be a number, got '$2'"; }
+
+write_cap() {
+    mkdir -p "$(dirname "$CAP_FILE")"
+    echo "$1" > "$CAP_FILE.tmp" && mv "$CAP_FILE.tmp" "$CAP_FILE"
+}
+
+show() {
+    local cap="off"
+    [[ -s "$CAP_FILE" ]] && cap="$(<"$CAP_FILE")"
+    [[ "$cap" == "0" ]] && cap="off"
+    echo "layer cap:  $cap"
+    if [[ -f "$XML" ]]; then
+        local ingame
+        ingame="$(grep -oP '<int name="FramerateCap">\K-?[0-9]+' "$XML" || true)"
+        echo "in-game cap: ${ingame:-unknown} (the layer can only go below this)"
+    fi
+}
+
+# Random integer in [lo, hi].
+rand_int() { echo $(( (RANDOM << 15 | RANDOM) % ($2 - $1 + 1) + $1 )); }
+
+# --- pattern runner ---------------------------------------------------------
+
+EVERY=""
+ONCE=0
+QUIET=0
+ARGS=()
+
+parse_pattern_opts() {
+    while (($#)); do
+        case "$1" in
+            -e | --every) [[ $# -ge 2 ]] || die "$1 needs a value"; EVERY="$2"; shift 2 ;;
+            --every=*) EVERY="${1#*=}"; shift ;;
+            --once) ONCE=1; shift ;;
+            -q | --quiet) QUIET=1; shift ;;
+            -*) die "unknown option '$1'" ;;
+            *) ARGS+=("$1"); shift ;;
+        esac
+    done
+}
+
+# Delay before the next step: a fixed number, or a random value in LO-HI.
+next_delay() {
+    if [[ "$EVERY" =~ ^([0-9]+([.][0-9]+)?)-([0-9]+([.][0-9]+)?)$ ]]; then
+        awk -v lo="${BASH_REMATCH[1]}" -v hi="${BASH_REMATCH[3]}" -v r="$RANDOM" \
+            'BEGIN { printf "%.3f", lo + (hi - lo) * r / 32767 }'
+    else
+        echo "$EVERY"
+    fi
+}
+
+step() {
+    write_cap "$1"
+    ((QUIET)) || printf '\rcap: %-8s' "$1"
+    sleep "$(next_delay)"
+}
+
+start_pattern() {
+    local default_every="$1"
+    [[ -n "$EVERY" ]] || EVERY="$default_every"
+    [[ "$EVERY" =~ ^[0-9]+([.][0-9]+)?(-[0-9]+([.][0-9]+)?)?$ ]] \
+        || die "--every must be SECS or LO-HI, got '$EVERY'"
+
+    # Put back whatever cap was set before the pattern started.
+    PREV_CAP=""
+    [[ -s "$CAP_FILE" ]] && PREV_CAP="$(<"$CAP_FILE")"
+    trap restore INT TERM
+}
+
+restore() {
+    if [[ -n "$PREV_CAP" ]]; then write_cap "$PREV_CAP"; else rm -f "$CAP_FILE"; fi
+    ((QUIET)) || echo
+    echo "restored cap: ${PREV_CAP:-off}"
+    exit 0
+}
+
+pattern_random() {
+    (( ${#ARGS[@]} >= 1 && ${#ARGS[@]} <= 2 )) || die "usage: soberfps random MAX [MIN]"
+    local max="${ARGS[0]}" min="${ARGS[1]:-1}"
+    [[ "$max" =~ ^[0-9]+$ && "$min" =~ ^[0-9]+$ ]] || die "random takes whole numbers"
+    ((min >= 1 && min <= max)) || die "need 1 <= MIN <= MAX"
+    start_pattern 1
+    while :; do step "$(rand_int "$min" "$max")"; done
+}
+
+pattern_seq() {
+    (( ${#ARGS[@]} >= 1 )) || die "usage: soberfps seq CAP [CAP ...]"
+    local c
+    for c in "${ARGS[@]}"; do need_num "cap" "$c"; done
+    start_pattern 1
+    while :; do
+        for c in "${ARGS[@]}"; do step "$c"; done
+        ((ONCE)) && break
+    done
+    ((QUIET)) || echo
+}
+
+pattern_ramp() {
+    (( ${#ARGS[@]} >= 2 && ${#ARGS[@]} <= 3 )) || die "usage: soberfps ramp FROM TO [STEP]"
+    local from="${ARGS[0]}" to="${ARGS[1]}" by="${ARGS[2]:-1}"
+    [[ "$from" =~ ^[0-9]+$ && "$to" =~ ^[0-9]+$ && "$by" =~ ^[0-9]+$ ]] \
+        || die "ramp takes whole numbers"
+    ((by >= 1)) || die "STEP must be at least 1"
+    local dir=$(( to >= from ? 1 : -1 )) c
+    start_pattern 1
+    while :; do
+        for ((c = from; dir > 0 ? c <= to : c >= to; c += dir * by)); do step "$c"; done
+        ((ONCE)) && break
+        # ...and back again, skipping the endpoints so they aren't held twice.
+        for ((c = to - dir * by; dir > 0 ? c > from : c < from; c -= dir * by)); do step "$c"; done
+    done
+    ((QUIET)) || echo
+}
+
+pattern_wave() {
+    (( ${#ARGS[@]} >= 2 && ${#ARGS[@]} <= 3 )) || die "usage: soberfps wave MIN MAX [SECS]"
+    local min="${ARGS[0]}" max="${ARGS[1]}" period="${ARGS[2]:-10}"
+    need_num MIN "$min"; need_num MAX "$max"; need_num SECS "$period"
+    start_pattern 0.1
+    local t0
+    t0="$(date +%s.%N)"
+    while :; do
+        step "$(awk -v a="$min" -v b="$max" -v p="$period" -v s="$t0" -v n="$(date +%s.%N)" \
+            'BEGIN { printf "%d", a + (b - a) * (1 - cos(2 * 3.14159265 * (n - s) / p)) / 2 + 0.5 }')"
+    done
+}
+
+# --- main -------------------------------------------------------------------
+
+cmd="${1:-}"
+[[ $# -gt 0 ]] && shift
+case "$cmd" in
+    "" | status) show ;;
+    off | none | unlimited) write_cap 0; show ;;
+    -h | --help | help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//' ;;
+    random | seq | ramp | wave) parse_pattern_opts "$@"; "pattern_$cmd" ;;
+    *)
+        is_num "$cmd" || die "expected a number, 'off', or a pattern (see --help), got '$cmd'"
+        write_cap "$cmd"
+        show
+        ;;
+esac

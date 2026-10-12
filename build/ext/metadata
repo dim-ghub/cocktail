@@ -1,0 +1,5 @@
+[Runtime]
+name=org.freedesktop.Platform.VulkanLayer.SoberFps
+
+[ExtensionOf]
+ref=runtime/org.freedesktop.Platform/x86_64/25.08
