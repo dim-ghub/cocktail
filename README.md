@@ -1,4 +1,4 @@
-# soberfps
+# Cocktail
 
 Change the FPS cap of Roblox running under Sober (`org.vinegarhq.Sober`) while it's running.
 
