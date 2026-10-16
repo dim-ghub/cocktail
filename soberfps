@@ -16,7 +16,13 @@
 #                                 random delay each step (default 1, wave: 0.1)
 #   --once                        stop at the end instead of repeating (seq, ramp)
 #   -q, --quiet                   don't print each change
-set -euo pipefail
+# Delegate to cocktail CLI if available
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if command -v cocktail &>/dev/null; then
+    exec cocktail fps "$@"
+elif [[ -x "$SCRIPT_DIR/cocktail" ]]; then
+    exec "$SCRIPT_DIR/cocktail" fps "$@"
+fi
 
 APP_DIR="$HOME/.var/app/org.vinegarhq.Sober"
 CAP_FILE="${SOBER_FPS_FILE:-$APP_DIR/cache/sober-fpscap}"

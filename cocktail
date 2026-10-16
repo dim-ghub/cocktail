@@ -1,0 +1,887 @@
+#!/usr/bin/env python3
+"""
+Cocktail: Unified CLI for Roblox on Linux (Nightcap & Sober)
+Features:
+  - Native Roblox Account Switcher manager (list, switch, import from Sober/browsers, launch specific accounts)
+  - Live FPS limiter (on-the-fly cap and patterns for Sober and Nightcap)
+"""
+
+import argparse
+import glob
+import hashlib
+import json
+import math
+import os
+import random
+import re
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+# --- Configuration & Paths ---
+
+USER_HOME = Path.home()
+UID = os.getuid()
+
+# Nightcap paths
+MOCKTAIL_SHARE = USER_HOME / ".local/share/mocktail"
+MOCKTAIL_CONFIG = USER_HOME / ".config/mocktail"
+MOCKTAIL_STATE = USER_HOME / ".local/state/mocktail"
+MOCKTAIL_CACHE = USER_HOME / ".cache/mocktail"
+MOCKTAIL_APP_STORAGE = MOCKTAIL_SHARE / "android/data/files/appData/LocalStorage/appStorage.json"
+MOCKTAIL_COOKIE_FILE = MOCKTAIL_SHARE / "auth/roblox.cookie"
+MOCKTAIL_XML = MOCKTAIL_SHARE / "android/data/files/appData/GlobalBasicSettings_13.xml"
+
+# Sober paths
+SOBER_FLATPAK_DIR = USER_HOME / ".var/app/org.vinegarhq.Sober"
+SOBER_FROSTSTRAP_DIR = USER_HOME / ".local/share/Froststrap/Versions/Sober"
+SOBER_DIR = SOBER_FROSTSTRAP_DIR if SOBER_FROSTSTRAP_DIR.exists() else SOBER_FLATPAK_DIR
+SOBER_APP_STORAGE = SOBER_DIR / "data/sober/appData/LocalStorage/appStorage.json"
+SOBER_COOKIES = SOBER_DIR / "data/sober/cookies"
+SOBER_XML = SOBER_DIR / "data/sober/appData/GlobalBasicSettings_13.xml"
+
+# Cocktail storage
+COCKTAIL_DIR = USER_HOME / ".local/share/cocktail"
+COCKTAIL_ACCOUNTS_DIR = COCKTAIL_DIR / "accounts"
+FPS_CAP_FILES = [
+    USER_HOME / ".cache/cocktail-fpscap",
+    USER_HOME / ".cache/sober-fpscap",
+    SOBER_FLATPAK_DIR / "cache/sober-fpscap",
+]
+
+DEFAULT_MOCKTAIL_BIN = "/usr/bin/mocktail"
+FALLBACK_MOCKTAIL_BIN = USER_HOME / "Projects/nightcap/build/mocktail"
+
+
+def get_mocktail_binary():
+    custom = os.environ.get("MOCKTAIL_BIN")
+    if custom and Path(custom).is_file() and os.access(custom, os.X_OK):
+        return str(custom)
+    if Path(DEFAULT_MOCKTAIL_BIN).is_file() and os.access(DEFAULT_MOCKTAIL_BIN, os.X_OK):
+        return DEFAULT_MOCKTAIL_BIN
+    if FALLBACK_MOCKTAIL_BIN.is_file() and os.access(FALLBACK_MOCKTAIL_BIN, os.X_OK):
+        return str(FALLBACK_MOCKTAIL_BIN)
+    bin_on_path = shutil.which("mocktail")
+    if bin_on_path:
+        return bin_on_path
+    die("Nightcap binary ('mocktail') not found in /usr/bin, ~/Projects/nightcap/build, or $PATH.")
+
+
+def die(msg, code=1):
+    print(f"\033[91m[cocktail error]\033[0m {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def info(msg):
+    print(f"\033[94m[cocktail]\033[0m {msg}")
+
+
+def success(msg):
+    print(f"\033[92m[cocktail]\033[0m {msg}")
+
+
+def warn(msg):
+    print(f"\033[93m[cocktail warning]\033[0m {msg}")
+
+
+def ensure_dirs():
+    COCKTAIL_DIR.mkdir(parents=True, exist_ok=True)
+    COCKTAIL_ACCOUNTS_DIR.mkdir(parents=True, exist_ok=True)
+    for cap_file in FPS_CAP_FILES:
+        try:
+            cap_file.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+
+# --- Account Manager ---
+
+def load_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(".tmp")
+    with open(temp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    temp.replace(path)
+
+
+def read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def validate_cookie(cookie_str):
+    """Hits Roblox API to check cookie and retrieve user identity."""
+    cookie = cookie_str.strip()
+    if not cookie.startswith(".ROBLOSECURITY="):
+        cookie = f".ROBLOSECURITY={cookie}"
+    req = urllib.request.Request(
+        "https://users.roblox.com/v1/users/authenticated",
+        headers={"Cookie": cookie, "Accept": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                return {
+                    "valid": True,
+                    "id": str(data.get("id")),
+                    "username": data.get("name"),
+                    "display_name": data.get("displayName"),
+                }
+    except Exception as e:
+        return {"valid": False, "error": str(e)}
+    return {"valid": False, "error": "Unknown verification failure"}
+
+
+def get_secret(app):
+    """Retrieves safe storage decryption secret from secret-tool or GNOME Keyring."""
+    if not shutil.which("secret-tool"):
+        return b"peanuts"
+    try:
+        out = subprocess.check_output(
+            ["secret-tool", "lookup", "application", app],
+            stderr=subprocess.DEVNULL, timeout=2
+        )
+        if out:
+            return out.strip()
+    except Exception:
+        pass
+    return b"peanuts"
+
+
+def decrypt_chromium_cookie(enc_bytes, secret_key):
+    """Decrypts Chromium v10/v11 DPAPI-equivalent cookies under Linux."""
+    if not enc_bytes.startswith(b"v10") and not enc_bytes.startswith(b"v11"):
+        try:
+            return enc_bytes.decode("utf-8", errors="ignore")
+        except Exception:
+            return None
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        raw = enc_bytes[3:]
+        derived_key = hashlib.pbkdf2_hmac("sha1", secret_key, b"saltysalt", 1, 16)
+        iv = b" " * 16
+        cipher = Cipher(algorithms.AES(derived_key), modes.CBC(iv))
+        decryptor = cipher.decryptor()
+        dec = decryptor.update(raw) + decryptor.finalize()
+        pad = dec[-1]
+        if isinstance(pad, int) and 0 < pad <= 16:
+            dec = dec[:-pad]
+        return dec.decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+
+
+def discover_browser_cookies():
+    """Extracts valid Roblox cookies from local browsers and stores."""
+    found = {}
+    patterns = [
+        ("Brave", USER_HOME / ".config/BraveSoftware/Brave-Browser/*", "brave"),
+        ("Chrome", USER_HOME / ".config/google-chrome/*", "chrome"),
+        ("Chromium", USER_HOME / ".config/chromium/*", "chromium"),
+        ("CiderHQ", USER_HOME / ".config/ciderhq/*", "ciderhq"),
+    ]
+
+    for browser_name, glob_pat, app_name in patterns:
+        secret = None
+        for prof in glob.glob(str(glob_pat)):
+            prof_dir = Path(prof)
+            if not prof_dir.is_dir():
+                continue
+            for cookie_rel in ["Cookies", "Network/Cookies"]:
+                db_path = prof_dir / cookie_rel
+                if db_path.is_file():
+                    if secret is None:
+                        secret = get_secret(app_name)
+                    tmp_db = Path(f"/tmp/cocktail_ck_{os.getpid()}_{random.randint(100, 999)}.sqlite")
+                    try:
+                        shutil.copy2(db_path, tmp_db)
+                        conn = sqlite3.connect(tmp_db)
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "SELECT name, value, encrypted_value FROM cookies WHERE host_key LIKE '%roblox.com%' AND name = '.ROBLOSECURITY'"
+                        )
+                        for r_name, val, enc_val in cursor.fetchall():
+                            ck = None
+                            if val:
+                                ck = val
+                            elif enc_val:
+                                ck = decrypt_chromium_cookie(enc_val, secret)
+                            if ck and "_|WARNING:" in ck and ck not in found:
+                                found[ck] = f"{browser_name} ({prof_dir.name})"
+                        conn.close()
+                    except Exception:
+                        pass
+                    finally:
+                        tmp_db.unlink(missing_ok=True)
+
+    # Firefox cookies (sqlite plaintext)
+    ff_glob = USER_HOME / ".mozilla/firefox/*.*/cookies.sqlite"
+    for ff_db in glob.glob(str(ff_glob)):
+        db_path = Path(ff_db)
+        if db_path.is_file():
+            tmp_db = Path(f"/tmp/cocktail_ff_{os.getpid()}_{random.randint(100, 999)}.sqlite")
+            try:
+                shutil.copy2(db_path, tmp_db)
+                conn = sqlite3.connect(tmp_db)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT value FROM moz_cookies WHERE host LIKE '%roblox.com%' AND name = '.ROBLOSECURITY'"
+                )
+                for (val,) in cursor.fetchall():
+                    if val and "_|WARNING:" in val and val not in found:
+                        found[val] = f"Firefox ({db_path.parent.name})"
+                conn.close()
+            except Exception:
+                pass
+            finally:
+                tmp_db.unlink(missing_ok=True)
+
+    # Nightcap host cookie
+    if MOCKTAIL_COOKIE_FILE.exists():
+        c_text = read_text(MOCKTAIL_COOKIE_FILE)
+        if c_text and "_|WARNING:" in c_text and c_text not in found:
+            found[c_text] = "Nightcap Host"
+
+    # Sober cookies
+    if SOBER_COOKIES.exists():
+        for sf in SOBER_COOKIES.glob("*.robloxcookie"):
+            c_text = read_text(sf)
+            if c_text and "_|WARNING:" in c_text and c_text not in found:
+                found[c_text] = f"Sober ({sf.stem})"
+        for f in SOBER_COOKIES.iterdir():
+            if f.is_file() and not f.name.endswith(".robloxcookie"):
+                c_text = read_text(f)
+                if c_text and "_|WARNING:" in c_text and c_text not in found:
+                    found[c_text] = f"Sober ({f.name})"
+
+    return found
+
+
+def get_all_accounts():
+    """Aggregates accounts from:
+    1. appStorage.json (Native Roblox Account Switcher)
+    2. Cocktail Account Vault (~/.local/share/cocktail/accounts)
+    3. Sober appStorage.json
+    """
+    accounts = {}
+
+    def parse_app_storage(storage_path, origin):
+        data = load_json(storage_path)
+        if not data:
+            return
+
+        blob_str = data.get("AccountBlob", "")
+        meta_map_str = data.get("AccountSwitcherMetadataMap", "")
+        prev_list_str = data.get("PreviousAccountsList", "")
+        active_user_id = str(data.get("UserId", "") or "")
+
+        meta_map = {}
+        if meta_map_str:
+            try:
+                meta_map = json.loads(meta_map_str)
+            except Exception:
+                pass
+
+        prev_list = []
+        if prev_list_str:
+            try:
+                prev_list = json.loads(prev_list_str)
+            except Exception:
+                pass
+
+        for entry in prev_list:
+            u_id = str(entry.get("userId", "") or "")
+            username = entry.get("username", "") or ""
+            disp = entry.get("displayName", "") or username
+            if not username and not u_id:
+                continue
+            key = username.lower() if username else u_id
+            if key not in accounts:
+                accounts[key] = {
+                    "username": username or f"User_{u_id}",
+                    "id": u_id,
+                    "display_name": disp,
+                    "source": origin,
+                    "in_native_switcher": True,
+                    "is_active": (u_id == active_user_id) if (active_user_id and u_id) else False,
+                    "cookie_available": False,
+                }
+
+        for u_id, m_data in meta_map.items():
+            username = m_data.get("username", "") or ""
+            disp = m_data.get("displayName", "") or username
+            key = username.lower() if username else str(u_id)
+            if key not in accounts:
+                accounts[key] = {
+                    "username": username or f"User_{u_id}",
+                    "id": str(u_id),
+                    "display_name": disp,
+                    "source": origin,
+                    "in_native_switcher": True,
+                    "is_active": (str(u_id) == active_user_id) if active_user_id else False,
+                    "cookie_available": False,
+                }
+            else:
+                accounts[key]["in_native_switcher"] = True
+                if not accounts[key]["display_name"]:
+                    accounts[key]["display_name"] = disp
+
+    # Parse Nightcap appStorage
+    if MOCKTAIL_APP_STORAGE.exists():
+        parse_app_storage(MOCKTAIL_APP_STORAGE, "Nightcap")
+
+    # Parse Sober appStorage
+    if SOBER_APP_STORAGE.exists():
+        parse_app_storage(SOBER_APP_STORAGE, "Sober")
+
+    # Parse Cocktail Vault
+    if COCKTAIL_ACCOUNTS_DIR.exists():
+        for acc_dir in COCKTAIL_ACCOUNTS_DIR.iterdir():
+            if acc_dir.is_dir():
+                meta_file = acc_dir / "meta.json"
+                meta = load_json(meta_file)
+                cookie_file = acc_dir / "roblox.cookie"
+                username = meta.get("username", acc_dir.name)
+                key = username.lower()
+                if key not in accounts:
+                    accounts[key] = {
+                        "username": username,
+                        "id": str(meta.get("id", "")),
+                        "display_name": meta.get("display_name", username),
+                        "source": "Cocktail Vault",
+                        "in_native_switcher": False,
+                        "is_active": False,
+                        "cookie_available": cookie_file.exists(),
+                        "cookie_file": cookie_file if cookie_file.exists() else None,
+                    }
+                else:
+                    if cookie_file.exists():
+                        accounts[key]["cookie_available"] = True
+                        accounts[key]["cookie_file"] = cookie_file
+                    if not accounts[key]["id"] and meta.get("id"):
+                        accounts[key]["id"] = str(meta.get("id"))
+
+    # Check Nightcap primary cookie
+    if MOCKTAIL_COOKIE_FILE.exists():
+        c_text = read_text(MOCKTAIL_COOKIE_FILE)
+        if c_text and "_|WARNING:" in c_text:
+            for acc in accounts.values():
+                if acc.get("is_active"):
+                    acc["cookie_available"] = True
+                    acc["cookie_file"] = MOCKTAIL_COOKIE_FILE
+
+    return list(accounts.values())
+
+
+def save_account_cookie(username, user_id, display_name, cookie_value):
+    ensure_dirs()
+    acc_dir = COCKTAIL_ACCOUNTS_DIR / username
+    acc_dir.mkdir(parents=True, exist_ok=True)
+    cookie_file = acc_dir / "roblox.cookie"
+    with open(cookie_file, "w", encoding="utf-8") as f:
+        f.write(cookie_value.strip())
+    os.chmod(cookie_file, 0o600)
+    meta_file = acc_dir / "meta.json"
+    save_json(meta_file, {
+        "username": username,
+        "id": str(user_id),
+        "display_name": display_name,
+        "updated_at": int(time.time()),
+    })
+
+
+def get_current_active_username():
+    data = load_json(MOCKTAIL_APP_STORAGE)
+    uid = str(data.get("UserId", "") or "")
+    if uid:
+        for acc in get_all_accounts():
+            if acc["id"] == uid:
+                return acc["username"]
+    return None
+
+
+def cmd_account_list(args):
+    accounts = get_all_accounts()
+    if not accounts:
+        info("No saved Roblox accounts found in native switcher or vault.")
+        info("Tip: Run 'cocktail account import' to automatically discover accounts from your browsers and Sober.")
+        return
+
+    print("\n\033[1mSaved Roblox Accounts\033[0m")
+    print(f"{'STATUS':<8} {'USERNAME':<22} {'USER ID':<14} {'DISPLAY NAME':<24} {'COOKIE':<8} {'SOURCE'}")
+    print("-" * 90)
+
+    for acc in sorted(accounts, key=lambda a: (not a.get("is_active", False), a["username"].lower())):
+        status = "\033[32mACTIVE\033[0m" if acc.get("is_active") else "      "
+        cookie_stat = "\033[32mYES\033[0m" if acc.get("cookie_available") else "\033[90mNO\033[0m "
+        disp = acc.get("display_name", "") or acc["username"]
+        uid = acc.get("id", "") or "-"
+        src = acc.get("source", "Native")
+        print(f"{status:<17} {acc['username']:<22} {uid:<14} {disp:<24} {cookie_stat:<17} {src}")
+    print()
+
+
+def find_account_by_query(query):
+    q = query.strip().lower()
+    accounts = get_all_accounts()
+    for acc in accounts:
+        if acc["username"].lower() == q or acc.get("id") == q:
+            return acc
+    for acc in accounts:
+        if acc["username"].lower().startswith(q):
+            return acc
+    return None
+
+
+def sync_active_instance_cookies():
+    """Detects and captures newly authenticated cookies from primary Nightcap."""
+    synced = 0
+    if MOCKTAIL_COOKIE_FILE.exists():
+        nc_cookie = read_text(MOCKTAIL_COOKIE_FILE)
+        if nc_cookie and "_|WARNING:" in nc_cookie:
+            val = validate_cookie(nc_cookie)
+            if val.get("valid"):
+                u = val["username"]
+                target_file = COCKTAIL_ACCOUNTS_DIR / u / "roblox.cookie"
+                if not target_file.exists() or read_text(target_file) != nc_cookie:
+                    save_account_cookie(u, val["id"], val["display_name"], nc_cookie)
+                    synced += 1
+    return synced
+
+
+def cmd_account_import(args):
+    info("Scanning local browser vaults, Sober, and Nightcap for active Roblox sessions...")
+    cookies = discover_browser_cookies()
+    if not cookies:
+        warn("No active Roblox sessions found in browsers or app directories.")
+        return
+
+    imported = 0
+    print()
+    for ck, source in cookies.items():
+        val = validate_cookie(ck)
+        if val.get("valid"):
+            u = val["username"]
+            uid = val["id"]
+            disp = val["display_name"]
+            save_account_cookie(u, uid, disp, ck)
+            success(f"Imported [{u}] ({disp}, ID: {uid}) from {source}")
+            imported += 1
+        else:
+            warn(f"Found cookie from {source} but it expired or was invalidated: {val.get('error')}")
+
+    print()
+    if imported > 0:
+        success(f"Successfully imported {imported} account(s) into Cocktail!")
+        sync_native_switcher_from_vault()
+    else:
+        warn("No valid session cookies were imported.")
+
+
+def sync_native_switcher_from_vault():
+    """Ensures accounts stored in Cocktail vault are listed in Nightcap's appStorage.json."""
+    if not MOCKTAIL_APP_STORAGE.exists():
+        return
+    data = load_json(MOCKTAIL_APP_STORAGE)
+    if not data:
+        return
+    prev_str = data.get("PreviousAccountsList", "")
+    prev_list = []
+    if prev_str:
+        try:
+            prev_list = json.loads(prev_str)
+        except Exception:
+            pass
+
+    existing_ids = {str(e.get("userId")) for e in prev_list if e.get("userId")}
+    changed = False
+
+    for acc in get_all_accounts():
+        uid = str(acc.get("id"))
+        if uid and uid not in existing_ids:
+            prev_list.append({
+                "userId": int(uid) if uid.isdigit() else uid,
+                "username": acc["username"],
+                "displayName": acc.get("display_name", acc["username"]),
+            })
+            existing_ids.add(uid)
+            changed = True
+
+    if changed:
+        data["PreviousAccountsList"] = json.dumps(prev_list)
+        save_json(MOCKTAIL_APP_STORAGE, data)
+        info("Synchronized native Roblox account switcher list.")
+
+
+def cmd_account_set_cookie(args):
+    account_query = args.account
+    cookie_val = args.cookie
+
+    if not cookie_val:
+        print(f"Paste the .ROBLOSECURITY cookie for '{account_query}': ", end="", flush=True)
+        try:
+            cookie_val = input().strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return
+
+    if not cookie_val or "_|WARNING:" not in cookie_val:
+        die("Invalid cookie format. Roblox security cookies start with '_|WARNING:-DO-NOT-SHARE-THIS...'.")
+
+    info("Validating cookie with Roblox API...")
+    val = validate_cookie(cookie_val)
+    if not val.get("valid"):
+        die(f"Cookie validation failed: {val.get('error')}")
+
+    username = val["username"]
+    uid = val["id"]
+    disp = val["display_name"]
+    save_account_cookie(username, uid, disp, cookie_val)
+    success(f"Cookie saved for {username} ({disp}, ID: {uid})!")
+    sync_native_switcher_from_vault()
+
+
+def cmd_account_sync(args):
+    info("Synchronizing captured cookies and active sessions...")
+    count = sync_active_instance_cookies()
+    sync_native_switcher_from_vault()
+    success(f"Synced {count} active session(s) into Cocktail.")
+
+
+def cmd_account_switch(args):
+    query = args.account
+    acc = find_account_by_query(query)
+    if not acc:
+        die(f"Account '{query}' not found. Run 'cocktail account list' to view available accounts.")
+
+    username = acc["username"]
+    user_id = acc.get("id")
+
+    # Update Nightcap appStorage.json
+    if MOCKTAIL_APP_STORAGE.exists():
+        data = load_json(MOCKTAIL_APP_STORAGE)
+        if data:
+            if user_id:
+                data["UserId"] = int(user_id) if str(user_id).isdigit() else user_id
+            data["Username"] = username
+            data["DisplayName"] = acc.get("display_name", username)
+            save_json(MOCKTAIL_APP_STORAGE, data)
+
+    # Update Nightcap auth/roblox.cookie if available
+    if acc.get("cookie_file") and acc["cookie_file"].exists():
+        MOCKTAIL_COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(acc["cookie_file"], MOCKTAIL_COOKIE_FILE)
+        os.chmod(MOCKTAIL_COOKIE_FILE, 0o600)
+        success(f"Switched active account and provisioned cookie for {username}!")
+    else:
+        success(f"Switched active account in native account switcher for {username} (will authenticate via native switcher on next launch).")
+
+
+# --- Nightcap Launcher ---
+
+def launch_nightcap(target_account=None, extra_args=None, enable_fps=True):
+    binary = get_mocktail_binary()
+    extra_args = extra_args or []
+
+    if target_account:
+        target_acc = find_account_by_query(target_account)
+        if not target_acc:
+            die(f"Account '{target_account}' not found. Use 'cocktail account list' to view available accounts.")
+        cmd_account_switch(argparse.Namespace(account=target_acc["username"]))
+
+    if enable_fps:
+        os.environ["COCKTAIL_FPSLIMIT"] = "1"
+        os.environ.pop("DISABLE_COCKTAIL_FPSLIMIT", None)
+        os.environ.pop("VK_LOADER_LAYERS_DISABLE", None)
+    else:
+        os.environ.pop("COCKTAIL_FPSLIMIT", None)
+        os.environ["DISABLE_COCKTAIL_FPSLIMIT"] = "1"
+        os.environ["VK_LOADER_LAYERS_DISABLE"] = "VK_LAYER_SOBER_fpslimit"
+
+    info(f"Launching Nightcap ({binary})...")
+    cmd = [binary] + extra_args
+    proc = subprocess.Popen(cmd)
+    success(f"Nightcap launched (PID: {proc.pid})")
+    return proc.pid
+
+
+def cmd_launch(args):
+    launch_nightcap(
+        target_account=args.account,
+        extra_args=args.extra_args,
+        enable_fps=not getattr(args, "no_fps", False),
+    )
+
+
+# --- Live FPS Limiter ---
+
+def write_fps_cap(value):
+    ensure_dirs()
+    val_str = str(value)
+    for cap_file in FPS_CAP_FILES:
+        try:
+            cap_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cap_file.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(val_str + "\n")
+            tmp.replace(cap_file)
+        except Exception:
+            pass
+
+
+def get_fps_status():
+    caps = {}
+    for cap_file in FPS_CAP_FILES:
+        if cap_file.exists():
+            txt = read_text(cap_file)
+            if txt:
+                caps[str(cap_file)] = txt
+
+    settings_caps = {}
+    if MOCKTAIL_XML.exists():
+        content = read_text(MOCKTAIL_XML)
+        m = re.search(r'<int name="FramerateCap">(\d+)</int>', content)
+        if m:
+            settings_caps["Nightcap GlobalBasicSettings_13.xml"] = m.group(1)
+
+    if SOBER_XML.exists():
+        content = read_text(SOBER_XML)
+        m = re.search(r'<int name="FramerateCap">(\d+)</int>', content)
+        if m:
+            settings_caps["Sober GlobalBasicSettings_13.xml"] = m.group(1)
+
+    return caps, settings_caps
+
+
+def parse_delay(every_str):
+    if not every_str:
+        return 1.0, 1.0
+    if "-" in every_str:
+        lo, hi = map(float, every_str.split("-", 1))
+        return lo, hi
+    val = float(every_str)
+    return val, val
+
+
+def run_pattern_step(cap, quiet=False):
+    write_fps_cap(cap)
+    if not quiet:
+        msg = f"Cap set to: {cap} FPS" if cap > 0 else "Cap: OFF (unlimited)"
+        print(f"\r\033[K\033[92m[cocktail fps]\033[0m {msg}", end="", flush=True)
+
+
+def cmd_fps(args):
+    action = args.action
+    pattern_args = args.pattern_args or []
+
+    if not action or action == "status":
+        caps, settings = get_fps_status()
+        print("\n\033[1mCocktail Vulkan FPS Limiter Status\033[0m")
+        print("-" * 50)
+        active_cap = None
+        for path, val in caps.items():
+            print(f"  Live layer cap ({Path(path).name}): \033[1m{val}\033[0m FPS")
+            if active_cap is None:
+                active_cap = val
+        if not caps:
+            print("  Live layer cap: \033[90mNot set (unlimited)\033[0m")
+
+        print()
+        for src, val in settings.items():
+            print(f"  In-game setting ({src}): \033[1m{val}\033[0m FPS")
+        print()
+        return
+
+    if action == "off" or action == "0":
+        write_fps_cap(0)
+        success("FPS limiter turned OFF (unlimited)")
+        return
+
+    # Check if action is a direct number
+    try:
+        val = int(action)
+        if val < 0:
+            die("FPS cap must be positive or 0.")
+        write_fps_cap(val)
+        success(f"FPS cap set to {val} FPS across Sober and Nightcap.")
+        return
+    except ValueError:
+        pass
+
+    # Save original cap to restore on Ctrl-C
+    caps, _ = get_fps_status()
+    orig_cap = 0
+    if caps:
+        try:
+            orig_cap = int(list(caps.values())[0])
+        except Exception:
+            pass
+
+    def restore_and_exit(signum=None, frame=None):
+        write_fps_cap(orig_cap)
+        print("\n\033[94m[cocktail fps]\033[0m Restored previous FPS cap. Exiting.")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, restore_and_exit)
+    signal.signal(signal.SIGTERM, restore_and_exit)
+
+    delay_lo, delay_hi = parse_delay(args.every)
+
+    if action == "random":
+        max_fps = int(pattern_args[0]) if pattern_args else 144
+        min_fps = int(pattern_args[1]) if len(pattern_args) > 1 else 1
+        info(f"Running random pattern ({min_fps}..{max_fps} FPS). Press Ctrl-C to stop.")
+        while True:
+            cur = random.randint(min_fps, max_fps)
+            run_pattern_step(cur, args.quiet)
+            time.sleep(random.uniform(delay_lo, delay_hi))
+
+    elif action == "seq":
+        if not pattern_args:
+            die("Usage: cocktail fps seq <cap1> <cap2> ...")
+        steps = [int(x) for x in pattern_args]
+        info(f"Running sequence pattern: {steps}. Press Ctrl-C to stop.")
+        while True:
+            for step in steps:
+                run_pattern_step(step, args.quiet)
+                time.sleep(random.uniform(delay_lo, delay_hi))
+            if args.once:
+                break
+        print()
+
+    elif action == "ramp":
+        if len(pattern_args) < 3:
+            die("Usage: cocktail fps ramp <low> <high> <step>")
+        low = int(pattern_args[0])
+        high = int(pattern_args[1])
+        step = int(pattern_args[2])
+        info(f"Running ramp pattern ({low} -> {high} by {step}). Press Ctrl-C to stop.")
+        while True:
+            for cur in range(low, high + 1, step):
+                run_pattern_step(cur, args.quiet)
+                time.sleep(random.uniform(delay_lo, delay_hi))
+            for cur in range(high - step, low, -step):
+                run_pattern_step(cur, args.quiet)
+                time.sleep(random.uniform(delay_lo, delay_hi))
+            if args.once:
+                break
+        print()
+
+    elif action == "wave":
+        low = int(pattern_args[0]) if pattern_args else 30
+        high = int(pattern_args[1]) if len(pattern_args) > 1 else 144
+        period = float(pattern_args[2]) if len(pattern_args) > 2 else 20.0
+        info(f"Running sine wave pattern ({low}..{high} FPS over {period}s). Press Ctrl-C to stop.")
+        t0 = time.time()
+        while True:
+            elapsed = time.time() - t0
+            sine_val = (math.sin(2 * math.pi * elapsed / period) + 1.0) / 2.0
+            cur = int(low + sine_val * (high - low))
+            run_pattern_step(cur, args.quiet)
+            time.sleep(0.05)
+
+    else:
+        die(f"Unknown action or pattern '{action}'. Valid: <number>, off, status, random, seq, ramp, wave")
+
+
+# --- Main Entrypoint ---
+
+def main():
+    # If invoked as 'soberfps', default to fps subcommand
+    invoked_as = Path(sys.argv[0]).name
+    if invoked_as == "soberfps":
+        sys.argv.insert(1, "fps")
+
+    parser = argparse.ArgumentParser(
+        prog="cocktail",
+        description="Cocktail: Native Account Switcher & FPS Manager for Nightcap & Sober",
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", help="Subcommand to execute")
+
+    # 1. launch
+    p_launch = subparsers.add_parser("launch", help="Launch Nightcap with optional account")
+    p_launch.add_argument("-a", "--account", help="Launch with specific account username or user ID")
+    p_launch.add_argument("--no-fps", "--no-layer", dest="no_fps", action="store_true", help="Launch without the Vulkan FPS limiter layer")
+    p_launch.add_argument("extra_args", nargs=argparse.REMAINDER, help="Arguments passed through to Nightcap")
+
+    # 2. account
+    p_acct = subparsers.add_parser("account", help="Manage native Roblox accounts")
+    acct_sub = p_acct.add_subparsers(dest="account_action", help="Account action")
+
+    acct_sub.add_parser("list", help="List accounts saved in the native account switcher")
+
+    p_acct_sw = acct_sub.add_parser("switch", help="Set the active account in the native account switcher")
+    p_acct_sw.add_argument("account", help="Username or user ID to switch to")
+
+    p_acct_ln = acct_sub.add_parser("launch", help="Launch Nightcap as a specific account")
+    p_acct_ln.add_argument("account", help="Username or user ID to launch")
+    p_acct_ln.add_argument("--no-fps", "--no-layer", dest="no_fps", action="store_true", help="Launch without the Vulkan FPS limiter layer")
+    p_acct_ln.add_argument("extra_args", nargs=argparse.REMAINDER, help="Additional Nightcap arguments")
+
+    acct_sub.add_parser("import", help="Import accounts & cookies from Sober, Brave, Chrome, Firefox, and CiderHQ")
+    acct_sub.add_parser("import-sober", help="Import AccountBlob and accounts from Sober (alias for import)")
+
+    p_acct_sc = acct_sub.add_parser("set-cookie", help="Manually store or paste a .ROBLOSECURITY cookie for an account")
+    p_acct_sc.add_argument("account", help="Username or user ID")
+    p_acct_sc.add_argument("cookie", nargs="?", help="Cookie value (optional, prompts if omitted)")
+
+    acct_sub.add_parser("sync", help="Sync active in-game logins and captured session cookies into Cocktail vault")
+
+    # 3. fps
+    p_fps = subparsers.add_parser("fps", help="Control live FPS limiter")
+    p_fps.add_argument("action", nargs="?", default="status", help="Cap (number, 'off', 'status', or pattern: random, seq, ramp, wave)")
+    p_fps.add_argument("pattern_args", nargs="*", help="Arguments for pattern")
+    p_fps.add_argument("-e", "--every", help="Time between changes (seconds or LO-HI range)")
+    p_fps.add_argument("--once", action="store_true", help="Step through once instead of repeating")
+    p_fps.add_argument("-q", "--quiet", action="store_true", help="Don't print each change")
+
+    args, unknown_args = parser.parse_known_args()
+
+    if not args.subcommand:
+        parser.print_help()
+        return
+
+    if args.subcommand == "launch":
+        args.extra_args = (args.extra_args or []) + unknown_args
+        cmd_launch(args)
+    elif args.subcommand == "account":
+        if not args.account_action or args.account_action == "list":
+            cmd_account_list(args)
+        elif args.account_action == "switch":
+            cmd_account_switch(args)
+        elif args.account_action == "launch":
+            extra = (args.extra_args or []) + unknown_args
+            launch_nightcap(
+                target_account=args.account,
+                extra_args=extra,
+                enable_fps=not getattr(args, "no_fps", False),
+            )
+        elif args.account_action in ("import", "import-sober"):
+            cmd_account_import(args)
+        elif args.account_action == "set-cookie":
+            cmd_account_set_cookie(args)
+        elif args.account_action == "sync":
+            cmd_account_sync(args)
+    elif args.subcommand == "fps":
+        cmd_fps(args)
+
+
+if __name__ == "__main__":
+    main()

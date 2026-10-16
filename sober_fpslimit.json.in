@@ -6,7 +6,7 @@
     "library_path": "@LIB@",
     "api_version": "1.4.0",
     "implementation_version": "1",
-    "description": "Live-adjustable FPS limiter for Sober",
+    "description": "Live-adjustable FPS limiter for Cocktail (Sober & Nightcap)",
     "functions": {
       "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
     },

@@ -20,10 +20,64 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <strings.h>
 
 #define EXPORT __attribute__((visibility("default")))
 #define LAYER_NAME "VK_LAYER_SOBER_fpslimit"
 #define MAX_ENTRIES 32
+
+static int is_target_process(void)
+{
+    const char *dis = getenv("DISABLE_COCKTAIL_FPSLIMIT");
+    if (dis && (!strcmp(dis, "1") || !strcasecmp(dis, "true"))) return 0;
+    dis = getenv("DISABLE_SOBER_FPSLIMIT");
+    if (dis && (!strcmp(dis, "1") || !strcasecmp(dis, "true"))) return 0;
+
+    const char *e = getenv("COCKTAIL_FPSLIMIT");
+    if (e && (!strcmp(e, "1") || !strcasecmp(e, "true"))) return 1;
+    e = getenv("SOBER_FPSLIMIT");
+    if (e && (!strcmp(e, "1") || !strcasecmp(e, "true"))) return 1;
+
+    char buf[1024];
+    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (len > 0) {
+        buf[len] = '\0';
+        if (strcasestr(buf, "mocktail") || strcasestr(buf, "nightcap") ||
+            strcasestr(buf, "sober") || strcasestr(buf, "roblox")) {
+            return 1;
+        }
+    }
+
+    int fd = open("/proc/self/cmdline", O_RDONLY);
+    if (fd >= 0) {
+        len = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (len > 0) {
+            buf[len] = '\0';
+            for (ssize_t i = 0; i < len; i++) {
+                if (buf[i] == '\0') buf[i] = ' ';
+            }
+            if (strcasestr(buf, "mocktail") || strcasestr(buf, "nightcap") ||
+                strcasestr(buf, "sober") || strcasestr(buf, "roblox")) {
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static int g_target_checked = 0;
+static int g_is_target = 0;
+
+static inline int check_target(void)
+{
+    if (!g_target_checked) {
+        g_is_target = is_target_process();
+        g_target_checked = 1;
+    }
+    return g_is_target;
+}
 
 /* ---- dispatch bookkeeping, keyed by the loader dispatch pointer ---- */
 
@@ -81,16 +135,17 @@ static uint64_t now_ns(void)
 
 static void init_path(void)
 {
-    const char *p = getenv("SOBER_FPS_FILE");
+    const char *p = getenv("COCKTAIL_FPS_FILE");
+    if (!p || !*p) p = getenv("SOBER_FPS_FILE");
     if (p && *p) {
         snprintf(g_path, sizeof g_path, "%s", p);
         return;
     }
     const char *cache = getenv("XDG_CACHE_HOME");
     if (cache && *cache)
-        snprintf(g_path, sizeof g_path, "%s/sober-fpscap", cache);
+        snprintf(g_path, sizeof g_path, "%s/cocktail-fpscap", cache);
     else
-        snprintf(g_path, sizeof g_path, "%s/.cache/sober-fpscap",
+        snprintf(g_path, sizeof g_path, "%s/.cache/cocktail-fpscap",
                  getenv("HOME") ? getenv("HOME") : "/tmp");
 }
 
@@ -101,9 +156,21 @@ static void refresh_cap(uint64_t now)
 
     struct stat st;
     if (stat(g_path, &st) != 0) {
-        g_interval_ns = 0;
-        g_last_mtime = (struct timespec){0};
-        return;
+        /* Fall back to sober-fpscap if cocktail-fpscap doesn't exist yet */
+        const char *cache = getenv("XDG_CACHE_HOME");
+        char fallback[4096];
+        if (cache && *cache)
+            snprintf(fallback, sizeof fallback, "%s/sober-fpscap", cache);
+        else
+            snprintf(fallback, sizeof fallback, "%s/.cache/sober-fpscap",
+                     getenv("HOME") ? getenv("HOME") : "/tmp");
+        if (stat(fallback, &st) == 0) {
+            snprintf(g_path, sizeof g_path, "%s", fallback);
+        } else {
+            g_interval_ns = 0;
+            g_last_mtime = (struct timespec){0};
+            return;
+        }
     }
     if (st.st_mtim.tv_sec == g_last_mtime.tv_sec &&
         st.st_mtim.tv_nsec == g_last_mtime.tv_nsec)
@@ -121,7 +188,7 @@ static void refresh_cap(uint64_t now)
     g_interval_ns = fps > 0.0 ? (uint64_t)(1e9 / fps) : 0;
 }
 
-/* SOBER_FPS_STATS=1 prints the delivered frame rate to stderr once a second. */
+/* SOBER_FPS_STATS=1 or COCKTAIL_FPS_STATS=1 prints the delivered frame rate to stderr once a second. */
 static int g_stats = -1;
 static uint64_t g_stats_start_ns;
 static unsigned g_stats_frames;
@@ -129,14 +196,15 @@ static unsigned g_stats_frames;
 static void count_frame(uint64_t now)
 {
     if (g_stats < 0) {
-        const char *s = getenv("SOBER_FPS_STATS");
+        const char *s = getenv("COCKTAIL_FPS_STATS");
+        if (!s || !*s) s = getenv("SOBER_FPS_STATS");
         g_stats = s && *s == '1';
         g_stats_start_ns = now;
     }
     if (!g_stats) return;
     g_stats_frames++;
     if (now - g_stats_start_ns >= 1000000000ull) {
-        fprintf(stderr, "sober-fpslimit: %.1f fps (cap %s%.0f)\n",
+        fprintf(stderr, "cocktail-fpslimit: %.1f fps (cap %s%.0f)\n",
                 g_stats_frames * 1e9 / (now - g_stats_start_ns),
                 g_interval_ns ? "" : "off ",
                 g_interval_ns ? 1e9 / g_interval_ns : 0.0);
@@ -192,9 +260,11 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *info)
     PFN_vkQueuePresentKHR next = d ? d->queue_present : NULL;
     pthread_mutex_unlock(&g_lock);
 
-    pthread_mutex_lock(&g_limit_lock);
-    limit_frame();
-    pthread_mutex_unlock(&g_limit_lock);
+    if (check_target()) {
+        pthread_mutex_lock(&g_limit_lock);
+        limit_frame();
+        pthread_mutex_unlock(&g_limit_lock);
+    }
     return next ? next(queue, info) : VK_ERROR_DEVICE_LOST;
 }
 
@@ -224,7 +294,11 @@ layer_CreateInstance(const VkInstanceCreateInfo *ci,
         slot->destroy_instance =
             (PFN_vkDestroyInstance)gipa(*out, "vkDestroyInstance");
     }
-    if (!g_path[0]) init_path();
+    if (check_target()) {
+        if (!g_path[0]) init_path();
+        if (getenv("COCKTAIL_FPS_STATS") || getenv("SOBER_FPS_STATS"))
+            g_stats = 1;
+    }
     pthread_mutex_unlock(&g_lock);
     return VK_SUCCESS;
 }
@@ -287,6 +361,7 @@ layer_DestroyDevice(VkDevice device, const VkAllocationCallbacks *alloc)
 
 static PFN_vkVoidFunction device_hook(const char *name)
 {
+    if (!check_target()) return NULL;
     if (!strcmp(name, "vkGetDeviceProcAddr")) return NULL; /* set below */
     if (!strcmp(name, "vkDestroyDevice")) return (PFN_vkVoidFunction)layer_DestroyDevice;
     if (!strcmp(name, "vkQueuePresentKHR")) return (PFN_vkVoidFunction)layer_QueuePresentKHR;

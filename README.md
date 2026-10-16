@@ -1,43 +1,94 @@
 # Cocktail
 
-Change the FPS cap of Roblox running under Sober (`org.vinegarhq.Sober`) while it's running.
+Unified CLI, native Roblox account manager, and live Vulkan FPS limiter for **Nightcap** and **Sober** on Linux.
 
-`fpslimit_layer.c` is a small Vulkan layer that waits in `vkQueuePresentKHR` until the next
-frame is due. It reads the cap from `~/.var/app/org.vinegarhq.Sober/cache/sober-fpscap`
-every 50 ms, and `soberfps` writes that file.
+---
 
-Sober crashes if a Vulkan layer's library is loaded from a writable path (anything under
-`~/.var/app`, even an unmodified vkBasalt), so the layer is packaged as a Flatpak
-`org.freedesktop.Platform.VulkanLayer` extension. It is mounted read-only at
-`/usr/lib/extensions/vulkan/SoberFps`, the same way vkBasalt is.
+## Features
 
+- **Native Roblox Account Switcher Manager**: Inspects and manages the native Roblox account switcher (`PreviousAccountsList`, `AccountBlob`, and `AccountSwitcherMetadataMap` in `appStorage.json`). Easily list accounts, switch active accounts, import accounts from Sober, Chrome, Brave, Firefox, and CiderHQ, and launch directly into any account.
+- **Live Vulkan FPS Limiter**: Dynamically adjust the frame rate cap on the fly while Roblox is running without restarting the game. Works for both native Nightcap and Flatpak Sober via the Vulkan layer (`VK_LAYER_SOBER_fpslimit`).
+
+---
+
+## Installation
+
+```bash
+# Build and install Cocktail CLI and native Vulkan layer (for Nightcap & host)
+make install-native
+
+# Or full install (including Flatpak VulkanLayer extension for Sober)
+make install
 ```
-make install      # build in org.gnome.Sdk//50, install the extension bundle,
-                  # set SOBER_FPSLIMIT=1 for Sober, install ~/.local/bin/soberfps
-soberfps 144      # cap at 144
-soberfps off      # no layer cap
-soberfps          # show current caps
+
+This installs `cocktail` (and backwards-compatible `soberfps`) to `~/.local/bin/`.
+
+---
+
+## Account Management (Native Account Switcher & Cookie Vault)
+
+Cocktail interfaces directly with Roblox's native account switcher and includes automated session discovery:
+
+```bash
+# List all accounts in the native switcher and cached vault
+cocktail account list
+
+# Auto-discover and import session cookies from Brave, Chrome, Firefox, Sober, and Nightcap
+cocktail account import
+
+# Manually store/paste a .ROBLOSECURITY session cookie for an account
+cocktail account set-cookie <username> [cookie]
+
+# Sync newly authenticated sessions from active instances
+cocktail account sync
+
+# Switch the default active account for next launch
+cocktail account switch <username>
+
+# Launch Nightcap directly into a specific account
+cocktail account launch <username>
+```
+
+---
+
+## Live FPS Limiter
+
+Change frame rate caps on the fly (via `VK_LAYER_SOBER_fpslimit`):
+
+```bash
+cocktail fps              # show current cap and in-game caps
+cocktail fps 144          # cap at 144 fps
+cocktail fps off          # remove the cap (unlimited)
+```
+
+### Patterns (Ctrl-C restores previous cap):
+```bash
+cocktail fps random 144            # random cap 1..144, new one every second
+cocktail fps random 144 30 -e 0.5-3  # 30..144, random 0.5–3 s delay
+cocktail fps seq 1 12 123          # step through caps
+cocktail fps seq 30 60 --once      # step through once, keep last cap
+cocktail fps ramp 10 120 5         # ramp up and down
+cocktail fps wave 30 144 20        # smooth sine wave between 30 and 144
+```
+
+`soberfps` remains fully functional as a direct alias for `cocktail fps`.
+
+### Disabling the Vulkan Layer
+If you want to launch Nightcap without the Vulkan FPS layer:
+```bash
+# Using Cocktail CLI flag
+cocktail launch --no-fps
+cocktail account launch <username> --no-fps
+
+# Or using environment variables
+DISABLE_COCKTAIL_FPSLIMIT=1 cocktail launch
+VK_LOADER_LAYERS_DISABLE=VK_LAYER_SOBER_fpslimit mocktail
+```
+
+---
+
+## Uninstallation
+
+```bash
 make uninstall
 ```
-
-Patterns run in the foreground and put the previous cap back on Ctrl-C:
-
-```
-soberfps random 144            # random cap 1..144, new one every second
-soberfps random 144 30 -e 0.5-3  # 30..144, random 0.5–3 s between changes
-soberfps seq 1 12 123          # 1 → 12 → 123 → 1 → ...
-soberfps seq 30 60 --once      # step through once, keep the last cap
-soberfps ramp 10 120 5         # 10, 15, ... 120, then back down, repeating
-soberfps wave 30 144 20        # smooth sine between 30 and 144, 20 s per cycle
-```
-
-`-e/--every SECS` (or `LO-HI` for a random delay) sets the time between changes, and
-`-q` hides the live readout. The layer checks for a new cap every 50 ms, even partway
-through a long frame, so very low caps like 1 fps switch away immediately.
-
-The layer only runs in apps with `SOBER_FPSLIMIT=1` (set for Sober by a `flatpak override`).
-It can only *lower* the frame rate below Roblox's own `FramerateCap` in
-`GlobalBasicSettings_13.xml`.
-
-Debugging: `flatpak run --env=SOBER_FPS_STATS=1 org.vinegarhq.Sober` prints the measured fps
-once a second.

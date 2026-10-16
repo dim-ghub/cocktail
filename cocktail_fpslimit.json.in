@@ -1,0 +1,17 @@
+{
+  "file_format_version": "1.1.2",
+  "layer": {
+    "name": "VK_LAYER_SOBER_fpslimit",
+    "type": "GLOBAL",
+    "library_path": "@LIB@",
+    "api_version": "1.4.0",
+    "implementation_version": "1",
+    "description": "Live-adjustable FPS limiter for Cocktail (Nightcap & Sober)",
+    "functions": {
+      "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+    },
+    "disable_environment": {
+      "DISABLE_COCKTAIL_FPSLIMIT": "1"
+    }
+  }
+}
