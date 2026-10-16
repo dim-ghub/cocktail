@@ -4,6 +4,7 @@ Cocktail: Unified CLI for Roblox on Linux (Nightcap & Sober)
 Features:
   - Native Roblox Account Switcher manager (list, switch, import from Sober/browsers, launch specific accounts)
   - Live FPS limiter (on-the-fly cap and patterns for Sober and Nightcap)
+  - Rejoin the last server (or server hop) with Nightcap or Sober
 """
 
 import argparse
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 # --- Configuration & Paths ---
@@ -44,6 +46,7 @@ SOBER_DIR = SOBER_FROSTSTRAP_DIR if SOBER_FROSTSTRAP_DIR.exists() else SOBER_FLA
 SOBER_APP_STORAGE = SOBER_DIR / "data/sober/appData/LocalStorage/appStorage.json"
 SOBER_COOKIES = SOBER_DIR / "data/sober/cookies"
 SOBER_XML = SOBER_DIR / "data/sober/appData/GlobalBasicSettings_13.xml"
+SOBER_LOG_DIRS = [d / "data/sober/sober_logs" for d in (SOBER_FROSTSTRAP_DIR, SOBER_FLATPAK_DIR)]
 
 # Cocktail storage
 COCKTAIL_DIR = USER_HOME / ".local/share/cocktail"
@@ -630,6 +633,158 @@ def cmd_launch(args):
     )
 
 
+# --- Rejoin / Server Hop ---
+
+JOIN_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}).*Joining game '([^']+)' place (\d+)")
+REJOIN_HOP_COOLDOWN = 600  # skip servers visited in the last 10 minutes when hopping
+
+
+def get_join_log_files(source="any"):
+    """Returns (client, path) for every log that may contain 'Joining game' lines, newest first."""
+    files = []
+    if source in ("any", "nightcap"):
+        for f in (MOCKTAIL_STATE / "logs/sessions").glob("*.log"):
+            files.append(("nightcap", f))
+    if source in ("any", "sober"):
+        for d in SOBER_LOG_DIRS:
+            for f in d.glob("*.log"):
+                if not f.is_symlink():
+                    files.append(("sober", f))
+
+    def mtime(entry):
+        try:
+            return entry[1].stat().st_mtime
+        except OSError:
+            return 0
+    return sorted(files, key=mtime, reverse=True)
+
+
+def parse_join_line(line):
+    m = JOIN_RE.search(line)
+    if not m:
+        return None
+    ts = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+    return {"ts": ts, "server": m.group(2), "place": m.group(3)}
+
+
+def find_last_join(source="any"):
+    """Finds the most recent server join across Nightcap and Sober logs."""
+    # A log can't contain a join newer than its mtime, so the newest log with a join holds the latest one.
+    for client, path in get_join_log_files(source):
+        last = None
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if "Joining game" in line:
+                        last = parse_join_line(line) or last
+        except OSError:
+            continue
+        if last:
+            last.update(client=client, log=path)
+            return last
+    return None
+
+
+def get_recently_visited_servers(cooldown=REJOIN_HOP_COOLDOWN):
+    cutoff = time.time() - cooldown
+    visited = set()
+    for _, path in get_join_log_files("any"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                break
+            for line in read_text(path).splitlines():
+                if "Joining game" in line:
+                    j = parse_join_line(line)
+                    if j and j["ts"] >= cutoff:
+                        visited.add(j["server"])
+        except OSError:
+            continue
+    return visited
+
+
+def pick_hop_server(place_id, current_server):
+    url = f"https://games.roblox.com/v1/games/{place_id}/servers/Public?sortOrder=Asc&limit=100"
+    info("Fetching server list...")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Cocktail"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        die(f"Failed to fetch server list: {e}")
+
+    servers = [s["id"] for s in data.get("data", [])
+               if s.get("id") != current_server and s.get("playing", 0) < s.get("maxPlayers", 0)]
+    if not servers:
+        die("No available servers found.")
+    recent = get_recently_visited_servers()
+    candidates = [s for s in servers if s not in recent]
+    if not candidates:
+        die("No unvisited servers available (all were visited in the last 10 minutes).")
+    return random.choice(candidates)
+
+
+def kill_client(name, pgrep_args):
+    try:
+        out = subprocess.check_output(["pgrep"] + pgrep_args, text=True)
+    except subprocess.CalledProcessError:
+        return
+    pids = [int(p) for p in out.split() if int(p) != os.getpid()]
+    if pids:
+        info(f"Stopping running {name} (PIDs: {', '.join(map(str, pids))})...")
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        time.sleep(2)
+
+
+def launch_sober(uri):
+    if not shutil.which("flatpak"):
+        die("flatpak is required to launch Sober.")
+    info("Launching Sober...")
+    proc = subprocess.Popen(["flatpak", "run", "org.vinegarhq.Sober", uri],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    success(f"Sober launched (PID: {proc.pid})")
+
+
+def cmd_rejoin(args):
+    join = find_last_join(args.source)
+    if not join:
+        where = "any Nightcap or Sober" if args.source == "any" else f"any {args.source.capitalize()}"
+        die(f"No 'Joining game' entry found in {where} log.")
+
+    client = {"mocktail": "nightcap"}.get(args.client, args.client) or join["client"]
+    joined_ago = int(time.time() - join["ts"])
+
+    print("\033[1mLast server:\033[0m")
+    print(f"  Server ID: {join['server']}")
+    print(f"  Place ID:  {join['place']}")
+    print(f"  Joined:    {joined_ago // 60}m {joined_ago % 60}s ago via {join['client'].capitalize()}")
+    print(f"  Log:       {join['log']}\n")
+
+    target_server = join["server"]
+    if args.hop:
+        target_server = pick_hop_server(join["place"], join["server"])
+        info(f"Selected server: {target_server}")
+
+    uri = f"roblox://experiences/start?placeId={join['place']}&gameInstanceId={target_server}"
+    if args.dry_run:
+        print(uri)
+        return
+
+    if client == "sober":
+        kill_client("Sober", ["-f", "bwrap.*-- sober"])
+        launch_sober(uri)
+    else:
+        kill_client("Nightcap", ["-x", "mocktail"])
+        launch_nightcap(
+            target_account=args.account,
+            extra_args=["--launch-uri", uri],
+            enable_fps=not args.no_fps,
+        )
+
+
 # --- Live FPS Limiter ---
 
 def write_fps_cap(value):
@@ -852,6 +1007,15 @@ def main():
     p_fps.add_argument("--once", action="store_true", help="Step through once instead of repeating")
     p_fps.add_argument("-q", "--quiet", action="store_true", help="Don't print each change")
 
+    # 4. rejoin
+    p_rejoin = subparsers.add_parser("rejoin", help="Rejoin the last server (or server hop) with Nightcap or Sober")
+    p_rejoin.add_argument("client", nargs="?", choices=["nightcap", "mocktail", "sober"], help="Client to rejoin with (default: whichever client last joined)")
+    p_rejoin.add_argument("-s", "--hop", action="store_true", help="Server hop to a random different server of the same place instead")
+    p_rejoin.add_argument("-f", "--from", dest="source", default="any", choices=["any", "nightcap", "sober"], help="Only look at this client's logs for the last server (default: any)")
+    p_rejoin.add_argument("-a", "--account", help="Nightcap: launch with a specific account")
+    p_rejoin.add_argument("--no-fps", "--no-layer", dest="no_fps", action="store_true", help="Nightcap: launch without the Vulkan FPS limiter layer")
+    p_rejoin.add_argument("--dry-run", action="store_true", help="Print the server and launch URI without launching")
+
     args, unknown_args = parser.parse_known_args()
 
     if not args.subcommand:
@@ -881,6 +1045,8 @@ def main():
             cmd_account_sync(args)
     elif args.subcommand == "fps":
         cmd_fps(args)
+    elif args.subcommand == "rejoin":
+        cmd_rejoin(args)
 
 
 if __name__ == "__main__":

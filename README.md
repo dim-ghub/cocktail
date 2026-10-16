@@ -7,6 +7,7 @@ Unified CLI, native Roblox account manager, and live Vulkan FPS limiter for **Ni
 ## Features
 
 - **Native Roblox Account Switcher Manager**: Inspects and manages the native Roblox account switcher (`PreviousAccountsList`, `AccountBlob`, and `AccountSwitcherMetadataMap` in `appStorage.json`). Easily list accounts, switch active accounts, import accounts from Sober, Chrome, Brave, Firefox, and CiderHQ, and launch directly into any account.
+- **Rejoin & Server Hop**: Jump back into the last server you were in (from Nightcap or Sober logs) using whichever client you choose, or hop to a different non-full server of the same game.
 - **Live Vulkan FPS Limiter**: Dynamically adjust the frame rate cap on the fly while Roblox is running without restarting the game. Works for both native Nightcap and Flatpak Sober via the Vulkan layer (`VK_LAYER_SOBER_fpslimit`).
 
 ---
@@ -84,6 +85,32 @@ cocktail account launch <username> --no-fps
 DISABLE_COCKTAIL_FPSLIMIT=1 cocktail launch
 VK_LOADER_LAYERS_DISABLE=VK_LAYER_SOBER_fpslimit mocktail
 ```
+
+---
+
+## Rejoin Last Server / Server Hop
+
+Cocktail reads the most recent `Joining game` entry from Nightcap and Sober logs, then relaunches straight into that server:
+
+```bash
+# Rejoin the last server with whichever client last joined it
+cocktail rejoin
+
+# Rejoin with a specific client (e.g. left a Sober server, rejoin it in Nightcap)
+cocktail rejoin nightcap
+cocktail rejoin sober
+
+# Only consider the last server joined in Sober's logs
+cocktail rejoin nightcap --from sober
+
+# Server hop: random non-full server of the same game, skipping ones visited in the last 10 minutes
+cocktail rejoin --hop
+
+# Show the server and launch URI without launching anything
+cocktail rejoin --dry-run
+```
+
+The chosen client is stopped first if it's already running, then relaunched into the server. Use `-a/--account` to rejoin Nightcap with a specific account.
 
 ---
 
